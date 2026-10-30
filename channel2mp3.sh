@@ -21,7 +21,7 @@
 # Result layout (inside BASE_DIR):
 #   LOG.md               the markdown log
 #   downloaded.txt       yt-dlp archive of processed video ids
-#   mp3/<id>.mp3         final mono MP3 files
+#   mp3/<slug>.mp3       final mono MP3 files (slugified video title)
 #   thumbs/<id>.jpg      cover images
 #   meta/<id>.info.json  raw yt-dlp metadata used to build the log
 #   raw/                 transient dir (emptied on success)
@@ -72,6 +72,52 @@ find_cover() {
   return 1
 }
 
+# make_slug <title> <id>: slugified title (lowercase, [a-z0-9]-), max 80 chars;
+# falls back to the video id when the title slugifies away entirely
+make_slug() {
+  local slug
+  slug="$(jq -rn --arg t "$1" '
+    $t | ascii_downcase | gsub("[^a-z0-9]+"; "-")
+    | gsub("(^-+|-+$)"; "")
+    | (if .[0:80] != . then .[0:80] else . end)
+    | gsub("(^-+|-+$)"; "")')"
+  [[ -z "$slug" ]] && slug="$2"
+  printf '%s' "$slug"
+}
+
+# Filenames: mp3 files are named <slug>.mp3. Slugs are kept unique across
+# all known videos (meta/ + raw/) by suffixing "-<id>" on collisions;
+# the registry is deterministic so names are stable across runs.
+declare -A NAME_OF NAME_OF_REVERSE   # id -> mp3 basename / slug -> owner id
+slug_registry_build() {
+  NAME_OF=()
+  NAME_OF_REVERSE=()
+  local f id title s
+  for f in "$META_DIR"/*.info.json "$RAW_DIR"/*.info.json; do
+    id="$(jq -r '.id' "$f" 2>/dev/null)"
+    [[ -z "$id" || "$id" == "null" ]] && continue
+    [[ -n "${NAME_OF[$id]:-}" ]] && continue   # same id in meta/ and raw/
+    title="$(jq -r '.title // ""' "$f" 2>/dev/null)"
+    s="$(make_slug "$title" "$id")"
+    while [[ -n "${NAME_OF_REVERSE[$s]:-}" ]]; do s="$s-$id"; done
+    NAME_OF[$id]="$s"
+    NAME_OF_REVERSE[$s]="$id"
+  done
+}
+# name_for <id> <title?> -> mp3 basename for this video
+name_for() {
+  local n="${NAME_OF[$1]:-}"
+  if [[ -z "$n" ]]; then
+    n="$(make_slug "$2" "$1")"
+    while [[ -n "${NAME_OF_REVERSE[$n]:-}" && "${NAME_OF_REVERSE[$n]}" != "$1" ]]; do
+      n="$n-$1"
+    done
+    NAME_OF[$1]="$n"
+    NAME_OF_REVERSE[$n]="$1"
+  fi
+  printf '%s' "$n"
+}
+
 echo "== Step 1/3: downloading source audio + thumbnails (yt-dlp)"
 # --ignore-errors: skip failed videos and continue with the rest of the channel.
 # --download-archive: re-runs only fetch new uploads.
@@ -87,11 +133,16 @@ yt-dlp \
   "$CHANNEL_URL" \
   || echo "   (yt-dlp reported errors; continuing with what was downloaded)"
 
+# build id -> mp3-name mapping so repair/convert/log agree on filenames
+slug_registry_build
+
 echo "== Step 1b/3: repairing conversions that failed in an earlier run"
 for info in "$META_DIR"/*.info.json; do
   id="$(jq -r '.id' "$info")"
   [[ -z "$id" || "$id" == "null" ]] && continue
-  [[ -s "$MP3_DIR/$id.mp3" ]] && continue
+  n="$(name_for "$id" "$(jq -r '.title // ""' "$info")")"
+  # mp3 already fine under either naming? then nothing to repair
+  [[ -s "$MP3_DIR/$n.mp3" || -s "$MP3_DIR/$id.mp3" ]] && continue
   # source still sitting in raw/ from an interrupted run? no re-download needed
   have_src=0
   for ext in webm m4a opus oga ogg aac mp3 flac wav; do
@@ -114,8 +165,16 @@ echo "== Step 2/3: converting to mono MP3 ($BITRATE) with ffmpeg"
 for info in "$RAW_DIR"/*.info.json; do
   id="$(jq -r '.id' "$info")"
   [[ -z "$id" || "$id" == "null" ]] && continue
-  mp3="$MP3_DIR/$id.mp3"
+  title="$(jq -r '.title // .id' "$info")"
+  n="$(name_for "$id" "$title")"
+  mp3="$MP3_DIR/$n.mp3"
   [[ -s "$mp3" ]] && continue   # already converted (previous run)
+  # migrate legacy id-named files produced by older script versions
+  if [[ "$n" != "$id" && -s "$MP3_DIR/$id.mp3" ]]; then
+    mv "$MP3_DIR/$id.mp3" "$mp3"
+    echo "   renamed mp3/$id.mp3 -> mp3/$n.mp3"
+    continue
+  fi
 
   # find the downloaded source audio for this id
   src=""
@@ -134,7 +193,7 @@ for info in "$RAW_DIR"/*.info.json; do
   upload="$(jq -r '.upload_date // ""' "$info")"
   uploader="$(jq -r '.uploader // .channel // ""' "$info")"
 
-  echo "   $(basename "$src") -> mp3/$id.mp3"
+  echo "   $(basename "$src") -> mp3/$n.mp3"
   codec_args=(-c:a libmp3lame -b:a "$BITRATE" -ac 1)
   map_args=(-map 0:a:0)
   if [[ -n "$cover" ]]; then
@@ -161,6 +220,10 @@ for info in "$RAW_DIR"/*.info.json; do
       "$mp3.part"; then
     mv "$mp3.part" "$mp3"
     rm -f "$src"   # success -> drop the intermediate source
+    # record in the download archive so re-runs don't re-fetch this video
+    # (single-video repair downloads would otherwise never get archived)
+    extractor="$(jq -r '.extractor // "youtube"' "$info")"
+    grep -qxF "$extractor $id" "$ARCHIVE" 2>/dev/null || printf '%s %s\n' "$extractor" "$id" >> "$ARCHIVE"
   else
     rm -f "$mp3.part"
     echo "   WARNING: ffmpeg failed for $id ($src)" >&2
@@ -201,6 +264,13 @@ jq -s -c 'sort_by(.upload_date // "9999", .id) | .[]' "$META_DIR"/*.info.json > 
     upload="$(jq -r '.upload_date // ""' <<<"$entry")"
     dur="$(jq -r '.duration_string // ""' <<<"$entry")"
 
+    n="$(name_for "$id" "$title")"   # mp3 basename (slug-based)
+    # the file may sit under any earlier naming scheme; prefer the current one
+    file_name=""
+    for cand in "$n.mp3" "$id.mp3"; do
+      [[ -s "$MP3_DIR/$cand" ]] && { file_name="$cand"; break; }
+    done
+
     cover=""
     for ext in jpg jpeg png webp; do
       [[ -f "$THUMB_DIR/$id.$ext" ]] && { cover="$id.$ext"; break; }
@@ -213,8 +283,8 @@ jq -s -c 'sort_by(.upload_date // "9999", .id) | .[]' "$META_DIR"/*.info.json > 
     echo
     [[ -n "$upload" ]] && echo "- Uploaded: ${upload:0:4}-${upload:4:2}-${upload:6:2}"
     [[ -n "$dur" ]] && echo "- Duration: $dur"
-    echo "- File: \`mp3/$id.mp3\`"
-    if [[ ! -s "$MP3_DIR/$id.mp3" ]]; then
+    echo "- File: \`mp3/${file_name:-$n.mp3}\`"
+    if [[ -z "$file_name" ]]; then
       echo "- :warning: mp3 missing (download or conversion failed; re-run the script)"
     fi
     echo "- URL: <$url>"
