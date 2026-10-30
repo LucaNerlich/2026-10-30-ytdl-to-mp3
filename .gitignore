@@ -3,3 +3,9 @@
 *.info.json
 *.webm
 *.jpg
+/.idea
+*.log
+*.part
+downloaded.txt
+LOG.md
+*.tmp
