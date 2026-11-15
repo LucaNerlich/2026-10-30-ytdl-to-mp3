@@ -11,6 +11,7 @@
 #   CHANNEL_URL="https://www.youtube.com/@somechannel/videos" ./channel2mp3.sh
 #   BITRATE=128k ./channel2mp3.sh
 #   LIMIT=3 ./channel2mp3.sh       # test run: first 3 videos only
+#   MIN_DURATION=1200 ./channel2mp3.sh   # only videos >= 20 min (seconds)
 #   COOKIES_FILE=cookies.txt ./channel2mp3.sh      # for members-only/age-restricted
 #
 # Re-running is safe: yt-dlp's download archive skips videos already
@@ -57,6 +58,9 @@ fi
 download_opts=("${ytdlp_opts[@]}")
 if [[ -n "${LIMIT:-}" ]]; then
   download_opts+=("--playlist-items" "1:$LIMIT")
+fi
+if [[ -n "${MIN_DURATION:-}" ]]; then
+  download_opts+=("--match-filter" "duration >= ${MIN_DURATION}")
 fi
 
 # find_cover <id> -> prints first existing cover file path, if any
